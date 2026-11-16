@@ -1,0 +1,112 @@
+name: Build MACID OS (Alpine)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'build/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out MACID source
+        uses: actions/checkout@v4
+
+      - name: Build with Alpine's official mkimage framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            alpine:3.24 \
+            sh -euxc '
+              apk add --no-cache alpine-sdk alpine-conf apk-tools fakeroot syslinux xorriso grub-efi mtools dosfstools squashfs-tools git
+              TAG="$(git ls-remote --tags --refs --sort=-v:refname https://gitlab.alpinelinux.org/alpine/aports.git "v3.24.*" | head -n1 | sed "s#.*refs/tags/##")"
+              test -n "$TAG"
+              echo "Using aports tag: $TAG"
+              git clone --depth 1 --branch 3.24-stable https://gitlab.alpinelinux.org/alpine/aports.git /tmp/aports
+              cp build/mkimg.macid.sh build/genapkovl-macid.sh /tmp/aports/scripts/
+              chmod 0755 /tmp/aports/scripts/mkimg.macid.sh /tmp/aports/scripts/genapkovl-macid.sh
+              abuild-keygen -a -i -n
+              export PACKAGER_PRIVKEY="$(find "$HOME/.abuild" -maxdepth 1 -type f -name "*.rsa" | head -n 1)"
+              test -n "$PACKAGER_PRIVKEY"
+              export PACKAGER_PUBKEY="${PACKAGER_PRIVKEY}.pub"
+              cd /tmp/aports/scripts
+              ./mkimage.sh \
+                --tag "$TAG" \
+                --outdir /work/dist \
+                --workdir /tmp/macid-mkimage-cache \
+                --arch x86_64 \
+                --profile macid \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.24/main \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.24/community \
+                --hostkeys \
+                --checksum
+            '
+
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso qemu-system-x86
+
+      - name: Verify ISO structure and boot entries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISO="$(find dist -maxdepth 1 -type f -name '*.iso' -print -quit)"
+          test -n "$ISO" && test -s "$ISO"
+          xorriso -indev "$ISO" -report_el_torito plain
+          for name in vmlinuz-lts initramfs-lts modloop-lts macid.apkovl.tar.gz; do
+            xorriso -indev "$ISO" -find / -name "$name" -print 2>/dev/null | grep -q "$name" \
+              || { echo "MISSING in ISO: $name"; exit 1; }
+            echo "found: $name"
+          done
+          sha256sum "$ISO"
+
+      - name: Boot ISO in QEMU (BIOS) and wait for MACID login prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISO="$(find dist -maxdepth 1 -type f -name '*.iso' -print -quit)"
+          test -n "$ISO"
+          : > serial.log
+          qemu-system-x86_64 \
+            -machine accel=tcg -m 1024 \
+            -cdrom "$ISO" -boot d \
+            -display none \
+            -serial file:serial.log \
+            -monitor none \
+            -no-reboot &
+          QPID=$!
+          ok=0
+          for i in $(seq 1 90); do
+            if grep -Eq 'macid login:|login:' serial.log; then ok=1; break; fi
+            kill -0 "$QPID" 2>/dev/null || break
+            sleep 5
+          done
+          kill "$QPID" 2>/dev/null || true
+          echo "----- serial console tail -----"
+          tail -n 80 serial.log || true
+          test "$ok" = 1 || { echo "ISO did not reach the MACID login prompt"; exit 1; }
+          echo "BOOT TEST PASSED (QEMU BIOS/serial)"
+
+      - name: Upload boot-tested build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MACID-OS-Alpine-x86_64
+          path: |
+            dist/*.iso
+            dist/*.sha256
+            serial.log
+          if-no-files-found: error
+          retention-days: 14
