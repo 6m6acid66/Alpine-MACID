@@ -12,10 +12,10 @@ profile_macid() {
   apkovl="genapkovl-macid.sh"
 
   # Use a temporary key for the local APK index. Do not require Alpine's
-a  # private release key to sign the kernel module loop.
-  modloop_sign=no
+  # private release key to sign the kernel modules loop.
+  modloop_sign=null
 
-  # These packages are placed in the ISO's local APK repository for expansion.
+  # These packages are placed in the ISO's primary local APK repository for expansion.
   # The first boot remains intentionally small until the base is verified.
   apks="$apks
     bash
@@ -50,6 +50,9 @@ EOF
 # Give the UEFI boot menu MACID identity.
 grub_gen_config() {
   cat <<EOF
+serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1
+terminal_input serial console
+terminal_output serial console
 set timeout=5
 set default=0
 menuentry "MACID OS (Live)" {
