@@ -1,0 +1,87 @@
+name: Build MACID OS (Alpine)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'build/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out MACID source
+        uses: actions/checkout@v4
+
+      - name: Build with Alpine's official mkimage framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            alpine:3.24 \
+            sh -euxc '
+              apk add --no-cache alpine-sdk fakeroot syslinux xorriso grub-efi mtools squashfs-tools
+              git clone --depth 1 --branch 3.24-stable https://gitlab.alpinelinux.org/alpine/aports.git /tmp/aports
+              cp build/mkimg.macid.sh /tmp/aports/scripts/
+              cp build/genapkovl-macid.sh /tmp/aports/scripts/
+              chmod 0755 /tmp/aports/scripts/mkimg.macid.sh /tmp/aports/scripts/genapkovl-macid.sh
+              abuild-keygen -a -i -n
+              export PACKAGER_PRIVKEY="$(find "$HOME/.abuild" -maxdepth 1 -type f -name "*.rsa" | head -n 1)"
+              test -n "$PACKAGER_PRIVKEY"
+              export PACKAGER_PUBKEY="${PACKAGER_PRIVKEY}.pub"
+              cd /tmp/aports/scripts
+              ./mkimage.sh \
+                --tag v3.24.4 \
+                --outdir /work/dist \
+                --workdir /tmp/macid-mkimage-cache \
+                --arch x86_64 \
+                --profile macid \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.24/main \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.24/community \
+                --hostkeys \
+                --checksum
+            '
+
+      - name: Install ISO verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso
+
+      - name: Verify ISO structure and boot entries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISO="$(find dist -maxdepth 1 -type f -name '*.iso' -print -quit)"
+          test -n "$ISO"
+          test -s "$ISO"
+          xorriso -indev "$ISO" -report_el_torito plain
+          CONTENTS="$(xorriso -indev "$ISO" -find / -name 'vmlinuz-lts' -print 2>&1)"
+          printf '%s\\n' "$CONTENTS"
+          printf '%s' "$CONTENTS" | grep -q 'vmlinuz-lts'
+          CONTENTS="$(xorriso -indev "$ISO" -find / -name 'initramfs-lts' -print 2>&1)"
+          printf '%s\\n' "$CONTENTS"
+          printf '%s' "$CONTENTS" | grep -q 'initramfs-lts'
+          CONTENTS="$(xorriso -indev "$ISO" -find / -name 'macid.apkovl.tar.gz' -print 2>&1)"
+          printf '%s\\n' "$CONTENTS"
+          printf '%s' "$CONTENTS" | grep -q 'macid.apkovl.tar.gz'
+          sha256sum "$ISO"
+
+      - name: Upload verified build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MACID-OS-Alpine-x86_64
+          path: |
+            dist/*.iso
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
